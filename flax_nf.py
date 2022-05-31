@@ -12,168 +12,82 @@ import matplotlib.pyplot as plt
 from matplotlib import animation, rc
 from sklearn import datasets
 
-from data import * 
+#from data import * 
+from model import NormalizingFlow
 
 
 FLAGS = flags.FLAGS
 
 flags.DEFINE_integer(
-		"n_epochs", default=int(5e4),
+		"n_epochs", default=2 * int(5e4),
 		help=("total training epochs")
 )
 flags.DEFINE_integer(
-		"n_batch", default=512,
+		"n_batch", default=256,
 		help=("batch size")
 )
 flags.DEFINE_integer(
-		"n_hidden", default=256,
+		"n_hidden", default=64,
 		help=("number of hidden neurons in layers")
 )
 flags.DEFINE_float(
-		"lr", default=0.0001,
+		"lr", default=0.01,
 		help=("learning rate")
 )
 flags.DEFINE_integer(
 		"n_data", default=4000,
-		help=("number of data points to sample from data")
+		help=("number of data points to sample from data dist")
 )
 flags.DEFINE_integer(
-		"n_flows", default=8,
+		"n_flows", default=6,
 		help=("number of flows in normalizing flow model")
 )
 flags.DEFINE_integer(
 		"n_sample", default=2000,
 		help=("number of points to sample when plotting")
 )
-
-
-class NormalizingFlow(nn.Module):
-    n_flows: int 
-    n_hidden: int
-    forward: bool
-
-    def setup(self):
-        self.flows = [
-            FlowUnit(forward=True, n_hidden=FLAGS.n_hidden, flip=True) 
-			for _ in range(self.n_flows)
-        ]
-
-    def prior_log_prob(self, x):
-        # return (-jnp.log(jnp.sqrt(2 * jnp.pi)) - (x ** 2) / (2.0 ** 2)).sum(1)
-        return jax.scipy.stats.multivariate_normal.logpdf(
-            x, mean=jnp.zeros((2,)), cov=jnp.eye(2)
-        )
-
-    def __call__(self, x):
-        logdet = 0.0
-        xs = []  # latents
-        if self.forward:
-            for flow in self.flows:
-                x, logdet_i = flow(x, sample=False)
-                xs.append(x)
-                logdet += logdet_i
-        else:
-            for flow in self.flows[::-1]:
-                x, logdet_i = flow(x, sample=True)
-                xs.append(x)
-                logdet += logdet_i
-
-        return x, self.prior_log_prob(x), logdet, xs
-
-
-class FlowUnit(nn.Module):
-	forward: bool
-	n_hidden: int
-	flip: bool
-
-	def setup(self):
-		self.scale_shift = nn.Sequential(
-			[
-				nn.Dense(self.n_hidden), nn.relu,
-				nn.Dense(self.n_hidden // 2), nn.relu,
-				nn.Dense(2),
-			]
-		)
-
-	def _forward(self, x):
-		d = x.shape[-1] // 2
-		x1, x2 = x[:, :d], x[:, d:]
-		if self.flip:
-			x2, x1 = x1, x2
-		
-		shift, log_scale = jnp.split(self.scale_shift(x1), 2, axis=1)
-
-		y2 = x2 * jnp.exp(log_scale) + shift
-
-		if self.flip:
-			x1, y2 = y2, x1
-
-		x = jnp.concatenate([x1, y2], axis=-1)
-		return x, jnp.sum(log_scale, axis=1)
-
-	def _backward(self, y):
-		d = y.shape[-1] // 2
-		y1, y2 = y[:, :d], y[:, d:]
-		if self.flip:
-			y1, y2 = y2, y1
-
-		shift, log_scale = jnp.split(self.scale_shift(y1), 2, axis=1)
-
-		x2 = (y2 - shift) * jnp.exp(-log_scale)
-
-		if self.flip:
-			y1, x2 = x2, y1
-
-		x = jnp.concatenate([y1, x2], axis=-1)
-		return x, jnp.sum(-log_scale, axis=1)
-	
-	def __call__(self, x, sample=False):
-		if not sample:
-			x, logdet = self._forward(x)
-		else:
-			x, logdet = self._backward(x)
-		return x, logdet
+flags.DEFINE_integer(
+		"n_dims", default=2,
+		help=("number of dimensions data / flow have")
+)
 
 
 @jax.jit
 def train_step(state, x):
-    def loss_fn(params):
-        """
-        Get logL-loss using prior log prob and flow determinants
-        """
-        z, prior_logprob, log_det, _ = NormalizingFlow(
-            n_flows=FLAGS.n_flows, 
+	def loss_fn(params):
+		"""
+		Get logL-loss using prior log prob and flow determinants
+		"""
+		z, prior_logprob, log_det, _ = NormalizingFlow(
+			n_flows=FLAGS.n_flows, 
 			n_hidden=FLAGS.n_hidden, 
-			forward=True
-        ).apply({"params": params}, x)
-        loss = -jnp.mean(prior_logprob + log_det)
-        # loss = jnp.nan_to_num(loss)
-        return loss
+		).apply({"params": params}, x, forward=True)
+		loss = -jnp.sum(prior_logprob + log_det)
+		return loss
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=False)
-    loss, grads = grad_fn(state.params)
-    state = state.apply_gradients(grads=grads)
-    return loss, state
+	grad_fn = jax.value_and_grad(loss_fn, has_aux=False)
+	loss, grads = grad_fn(state.params)
+	state = state.apply_gradients(grads=grads)
+	return loss, state
 
 
 @jax.jit
 def eval_step(params, x):
-    z, _, _, _ = NormalizingFlow(
-        n_flows=FLAGS.n_flows, 
+	# return reconstructed img / latent
+	z, _, _, _ = NormalizingFlow(
+		n_flows=FLAGS.n_flows, 
 		n_hidden=FLAGS.n_hidden, 
-		forward=True
-    ).apply({"params": params}, x)
-    x, _, _, _ = NormalizingFlow(
-        n_flows=FLAGS.n_flows, 
+	).apply({"params": params}, x)
+	x, _, _, _ = NormalizingFlow(
+		n_flows=FLAGS.n_flows, 
 		n_hidden=FLAGS.n_hidden, 
-		forward=False
-    ).apply({"params": params}, z)
-    return z, x
+	).apply({"params": params}, z)
+	return z, x
 
 
 def select_data(data, key):
-    ix = random.randint(key, (FLAGS.n_batch,), 0, data.shape[0])
-    return data[ix]
+	ix = random.randint(key, (FLAGS.n_batch,), 0, data.shape[0])
+	return data[ix]
 
 
 def main(argv):
@@ -192,10 +106,31 @@ def main(argv):
 			cov=cov
 	)
 
+	def oliver_dist(data):
+		x, y = data.T
+		z_1 = 0.3 * x
+		z_2 = y
+		z_1 = z_1 + 0.3*z_2**2
+		data = jnp.stack([z_1, z_2])
+		print(data.shape)
+		return data.T
+
+	moons = oliver_dist(moons)
+
+	key1, key2 = random.split(rng)
+	"""
+	x2_samples = random.normal(key1, (FLAGS.n_data,)) * 4.0
+	x1_samples = random.normal(key2, (FLAGS.n_data,)) * 1.0 + 0.25 * jnp.multiply(x2_samples,x2_samples)
+	moons = jnp.stack([x1_samples, x2_samples], 1)
+	"""
+
 	rng, init_rng, init_x_rng = random.split(rng, 3)
 
 	# instantiate model and parameters
-	model = NormalizingFlow(n_flows=FLAGS.n_flows, n_hidden=FLAGS.n_hidden, forward=True)
+	model = NormalizingFlow(
+			n_flows=FLAGS.n_flows, 
+			n_hidden=FLAGS.n_hidden, 
+	)
 	params = model.init(init_rng, jnp.ones([3, 2]))["params"]
 
 	# get optimizer and train state holder
@@ -207,14 +142,14 @@ def main(argv):
 
 	# sample some initial points to generate with before/after training
 	z = random.normal(init_x_rng, (FLAGS.n_sample, 2))
+
+	# initialise flow
 	init_x, _, _, _ = NormalizingFlow(
 		n_flows=FLAGS.n_flows, 
 		n_hidden=FLAGS.n_hidden, 
-		forward=False
 	).apply({"params": params}, z)
 
 	losses = []
-
 	for e in range(FLAGS.n_epochs):
 		rng, data_rng = random.split(rng)
 
@@ -223,16 +158,16 @@ def main(argv):
 		loss, state = train_step(state, x)
 
 		losses.append(loss)
-		print("\r %08d %.8f" % (e, loss), end="")
+		print("\r %08d %.3E" % (e, loss), end="")
 
 	# sample some points after training
 	x, _, _, xs = NormalizingFlow(
 		n_flows=FLAGS.n_flows, 
 		n_hidden=FLAGS.n_hidden, 
-		forward=False
-	).apply({"params": state.params}, z)
+	).apply({"params": state.params}, z, forward=False)
 
 	# z, x = eval_step(state.params, x)
+
 
 	"""
 		plot initial / final flow outputs, data distribution
@@ -251,8 +186,10 @@ def main(argv):
 	ax[0].legend()
 	# losses
 	ax[0].axis("off")
-	ax[1].plot(losses[::200])
+	#ax[1].plot(losses[::200])
+	ax[1].semilogy(losses[::200])
 	plt.savefig("test.png")
+	plt.close()
 
 	"""
 		Grid plot of all flows	
@@ -260,7 +197,6 @@ def main(argv):
 
 	s = int(FLAGS.n_flows ** 0.5)
 	fig, ax = plt.subplots(s, s, dpi=200, figsize=(6.0, 6.0))
-	# moons dataset
 	c = 0
 	for i in range(s):
 		for j in range(s):
